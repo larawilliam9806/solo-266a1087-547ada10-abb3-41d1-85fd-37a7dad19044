@@ -21,7 +21,7 @@ import json
 import os
 import uuid
 
-from . import convert, db, domain
+from . import convert, db, domain, ridership_supply
 from .errors import AppError, Conflict, NotFound, Unprocessable, Unavailable
 from .storage import BlobStore
 
@@ -102,6 +102,7 @@ def _preview_public_payload(preview):
             for name in domain.DOWNSTREAM_ORDER
         },
         "downstreams": result["downstreams"],
+        "ridership_supply": result.get("ridership_supply"),
         "created_at": preview["created_at"],
         "expires_at": preview["expires_at"],
     }
@@ -139,6 +140,7 @@ class Service:
             try:
                 contracts = db.get_contracts(conn)
                 base_rev = db.day_revision(conn, day)
+                supply_status = db.supply_feature_status(conn)
             finally:
                 conn.execute("COMMIT")
             db.purge_expired_previews(conn)
@@ -149,6 +151,11 @@ class Service:
                 results[name] = outcome
                 if outcome["status"] != "ok":
                     convertible = False
+            supply_validation = ridership_supply.validate_batch(parsed)
+            supply_preview = {
+                "feature": supply_status,
+                "validation": supply_validation.as_preview(),
+            }
             original_name = _safe_name(filename)
             original_sha = self.store.put_bytes(raw_bytes)
             for name in domain.DOWNSTREAM_ORDER:
@@ -176,6 +183,7 @@ class Service:
                 },
                 "downstreams": results,
                 "convertible": convertible,
+                "ridership_supply": supply_preview,
             }
             preview_id = uuid.uuid4().hex
             with db.transaction(conn):
@@ -343,6 +351,50 @@ class Service:
                 # The preview row is now consumed; publications are the only
                 # thing downloads resolve against, so the preview can go.
                 db.delete_preview(conn, preview_id)
+
+                # ----------------------------------------------------------
+                # Ridership supply registration, same transaction.
+                # Re-validate the stored original rather than trusting the
+                # preview.  Any failure here rolls the whole confirm back, so
+                # the official revision and the supply dataset never diverge.
+                # A new registration for this issue day automatically withdraws
+                # the previous revision's rows because supply reads join on
+                # days.current_rev.
+                # ----------------------------------------------------------
+                supply_status = db.supply_feature_status(conn)
+                supply = ridership_supply.validate_batch(parsed)
+                eligible = False
+                reason_code = None
+                reason_detail = None
+                if not supply_status["enabled"]:
+                    reason_code = ridership_supply.REASON_FEATURE_DISABLED
+                    reason_detail = ridership_supply.REASON_LABELS[reason_code]
+                elif supply_status["enabled_at"] > created_at:
+                    reason_code = ridership_supply.REASON_PUBLISHED_BEFORE_ENABLED
+                    reason_detail = ridership_supply.REASON_LABELS[reason_code]
+                elif not supply.eligible:
+                    reason_code = supply.reason
+                    reason_detail = supply.reason_detail
+                else:
+                    eligible = True
+                db.insert_supply_registration(
+                    conn,
+                    issue_day=day,
+                    rev=new_rev,
+                    eligible=eligible,
+                    reason_code=reason_code,
+                    reason_detail=reason_detail,
+                    row_count=len(supply.rows) if eligible else 0,
+                    created_at=created_at,
+                )
+                if eligible:
+                    db.insert_supply_rows(
+                        conn,
+                        issue_day=day,
+                        rev=new_rev,
+                        rows=supply.rows,
+                        created_at=created_at,
+                    )
                 row = db.get_publication(conn, day, new_rev)
             return 201, _publication_payload(row)
         finally:
@@ -363,11 +415,24 @@ class Service:
         conn = self.conn_factory()
         try:
             revisions = db.list_publications(conn, day)
-            return {
+            payload = {
                 "day": day,
                 "current_rev": db.day_revision(conn, day),
                 "revisions": [_publication_payload(r) for r in revisions],
             }
+            for item in payload["revisions"]:
+                registration = db.get_supply_registration(conn, day, item["rev"])
+                if registration is None:
+                    item["ridership_supply"] = None
+                else:
+                    item["ridership_supply"] = {
+                        "eligible": bool(registration["eligible"]),
+                        "reason_code": registration["reason_code"],
+                        "reason_detail": registration["reason_detail"],
+                        "row_count": registration["row_count"],
+                        "registered_at": registration["created_at"],
+                    }
+            return payload
         finally:
             conn.close()
 
@@ -432,5 +497,147 @@ class Service:
             }
         finally:
             conn.close()
+
+    # ------------------------------------------------------------------
+    # ridership supply ("客流供数")
+    # ------------------------------------------------------------------
+    def get_supply_status(self):
+        conn = self.conn_factory()
+        try:
+            return db.supply_feature_status(conn)
+        finally:
+            conn.close()
+
+    def enable_supply(self):
+        conn = self.conn_factory()
+        try:
+            with db.transaction(conn, immediate=True):
+                return db.enable_supply_feature(conn)
+        finally:
+            conn.close()
+
+    def supply_plan(self, start_day, end_day):
+        """Build the full export plan from one consistent read snapshot.
+
+        Both the detail CSVs and the manifest inside the ZIP come out of this
+        single snapshot, so they can never disagree.  Packaging only reads
+        registered supply data; concurrent confirmations are serialised by
+        SQLite and simply land in a later snapshot.
+        """
+        start, end = ridership_supply.check_date_range(start_day, end_day)
+        travel_days = ridership_supply.enumerate_travel_days(start, end)
+        conn = self.conn_factory()
+        try:
+            # One read-only transaction pins one database snapshot for the
+            # whole plan, including manifest and exclusion list.
+            conn.execute("BEGIN")
+            try:
+                feature = db.supply_feature_status(conn)
+                rows = db.current_supply_rows_for_dates(conn, travel_days)
+                current_sources = db.current_supply_sources(conn, travel_days)
+                all_current = db.all_current_publications(conn)
+                generated_at = db.iso(db.utcnow())
+            finally:
+                conn.execute("COMMIT")
+        finally:
+            conn.close()
+
+        daily_rows = {day: [] for day in travel_days}
+        for item in rows:
+            travel_day = item["travel_date"]
+            if travel_day in daily_rows:
+                daily_rows[travel_day].append([
+                    item["train_no"],
+                    item["depart_station"],
+                    item["arrive_station"],
+                    item["travel_date"],
+                    item["passenger_count"],
+                ])
+
+        source_entries = self._source_entries(travel_days, rows)
+        source_keys = {
+            (entry[3], entry[4]) for entry in source_entries
+        }
+        exclusion_entries = self._exclusion_entries(
+            all_current, current_sources, source_keys
+        )
+        return {
+            "travel_days": travel_days,
+            "daily_rows": daily_rows,
+            "source_entries": source_entries,
+            "exclusion_entries": exclusion_entries,
+            "generated_at": generated_at,
+            "feature_enabled": feature["enabled"],
+            "feature_enabled_at": feature["enabled_at"],
+        }
+
+    @staticmethod
+    def _source_entries(travel_days, rows):
+        """One manifest row per (CSV file, source batch) pair."""
+        per_file = {day: {} for day in travel_days}
+        registered_at = {}
+        for item in rows:
+            travel_day = item["travel_date"]
+            if travel_day not in per_file:
+                continue
+            key = (item["issue_day"], item["rev"])
+            per_file[travel_day].setdefault(key, 0)
+            per_file[travel_day][key] += 1
+            registered_at[key] = item["registered_at"]
+        entries = []
+        for travel_day in travel_days:
+            for (issue_day, rev), count in sorted(per_file[travel_day].items()):
+                entries.append([
+                    f"ridership-{travel_day}.csv",
+                    travel_day,
+                    count,
+                    issue_day,
+                    rev,
+                    registered_at[(issue_day, rev)],
+                ])
+        return entries
+
+    @staticmethod
+    def _exclusion_entries(all_current, current_sources, source_keys):
+        """Every current official batch not represented in the package, why."""
+        source_meta = {
+            (item["issue_day"], item["rev"]): item for item in current_sources
+        }
+        entries = []
+        for publication in all_current:
+            key = (publication["issue_day"], publication["rev"])
+            if key in source_keys:
+                continue
+            meta = source_meta.get(key)
+            if meta is not None and not meta["eligible"]:
+                reason_code = meta["reason_code"] or "excluded"
+                reason = meta["reason_detail"] or ridership_supply.REASON_LABELS.get(
+                    reason_code, "未纳入供数"
+                )
+            else:
+                # Either an eligible batch with no rows in the requested
+                # window, or a pre-enablement batch with no registration row.
+                reason_code = "no_rows_in_window"
+                reason = "当前正式批次没有本乘车日区间内的供数明细"
+            entries.append([
+                publication["issue_day"],
+                publication["rev"],
+                publication["published_at"],
+                reason_code,
+                reason,
+            ])
+        return entries
+
+    def build_supply_zip(self, start_day, end_day):
+        plan = self.supply_plan(start_day, end_day)
+        archive = ridership_supply.build_zip_bytes(
+            travel_days=plan["travel_days"],
+            daily_rows=plan["daily_rows"],
+            source_entries=plan["source_entries"],
+            exclusion_entries=plan["exclusion_entries"],
+            generated_at=plan["generated_at"],
+            feature_enabled=plan["feature_enabled"],
+        )
+        return archive, plan
 
 

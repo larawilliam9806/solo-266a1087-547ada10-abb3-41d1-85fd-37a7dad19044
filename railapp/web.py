@@ -14,7 +14,7 @@ from flask import (
     url_for,
 )
 
-from . import convert, db, domain
+from . import convert, db, domain, ridership_supply
 from .errors import AppError, NotFound, Unprocessable
 from .publisher import Service
 from .storage import BlobStore, verify_publications
@@ -225,6 +225,22 @@ def create_app(config=None):
             abort(404)
         return render_template("day.html", detail=detail)
 
+    @app.get("/ridership")
+    def ridership_page():
+        conn = get_conn()
+        try:
+            status = db.supply_feature_status(conn)
+            days = db.list_days(conn, limit=20)
+        finally:
+            conn.close()
+        return render_template(
+            "ridership.html",
+            supply_status=status,
+            days=days,
+            supply_columns=ridership_supply.SUPPLY_COLUMNS,
+            max_range_days=ridership_supply.MAX_RANGE_DAYS,
+        )
+
     # ------------------------------------------------------------------
     # API
     # ------------------------------------------------------------------
@@ -309,6 +325,56 @@ def create_app(config=None):
         return jsonify({"status": "ok", "damaged_revisions": damaged})
 
     # ------------------------------------------------------------------
+    # ridership supply ("客流供数")
+    # ------------------------------------------------------------------
+    @app.get("/api/ridership-supply")
+    def api_supply_status():
+        return jsonify(service.get_supply_status())
+
+    @app.post("/api/ridership-supply/enable")
+    def api_supply_enable():
+        return jsonify(service.enable_supply())
+
+    @app.get("/api/ridership-supply/plan")
+    def api_supply_plan():
+        start_day = request.args.get("start")
+        end_day = request.args.get("end")
+        plan = service.supply_plan(start_day, end_day)
+        # JSON-friendly summary of the same snapshot used by the ZIP route.
+        return jsonify({
+            "travel_days": plan["travel_days"],
+            "feature_enabled": plan["feature_enabled"],
+            "feature_enabled_at": plan["feature_enabled_at"],
+            "generated_at": plan["generated_at"],
+            "files": [
+                {
+                    "file": f"ridership-{day}.csv",
+                    "travel_date": day,
+                    "row_count": len(plan["daily_rows"][day]),
+                }
+                for day in plan["travel_days"]
+            ],
+            "manifest_sources": plan["source_entries"],
+            "manifest_exclusions": plan["exclusion_entries"],
+        })
+
+    @app.get("/ridership-supply.zip")
+    def api_supply_zip():
+        start_day = request.args.get("start")
+        end_day = request.args.get("end")
+        archive, plan = service.build_supply_zip(start_day, end_day)
+        filename = "ridership-supply-%s-to-%s.zip" % (
+            plan["travel_days"][0],
+            plan["travel_days"][-1],
+        )
+        response = Response(archive, mimetype="application/zip", direct_passthrough=True)
+        response.headers["Content-Length"] = str(len(archive))
+        response.headers["Content-Disposition"] = _content_disposition(filename)
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["X-Supply-Snapshot-At"] = plan["generated_at"]
+        return response
+
+    # ------------------------------------------------------------------
     # downloads
     # ------------------------------------------------------------------
     @app.get("/download/<day>/<rev>/<kind>")
@@ -352,9 +418,8 @@ def create_app(config=None):
         ascii_fallback = "".join(
             ch if 32 <= ord(ch) < 127 and ch not in '"\\' else "_" for ch in name
         )
-        suffix = ".csv"
-        if not ascii_fallback.lower().endswith(".csv"):
-            ascii_fallback = ascii_fallback + suffix
+        if "." not in ascii_fallback.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]:
+            ascii_fallback = ascii_fallback + ".csv"
         return "attachment; filename=\"%s\"; filename*=UTF-8''%s" % (
             ascii_fallback,
             quote(name, safe=""),

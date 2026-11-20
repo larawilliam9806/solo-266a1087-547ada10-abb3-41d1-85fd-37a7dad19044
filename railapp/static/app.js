@@ -141,6 +141,35 @@
     return node;
   }
 
+  function renderSupply(preview) {
+    const block = document.getElementById("supply-root");
+    if (!block || !preview.ridership_supply) return;
+    const { feature, validation } = preview.ridership_supply;
+    block.hidden = false;
+    const badge = block.querySelector(".supply-badge");
+    badge.textContent = validation.eligible ? "可纳入供数" : "不纳入供数";
+    badge.className = "badge " + (validation.eligible ? "ok" : "bad");
+    block.querySelector(".supply-feature").textContent = feature.enabled
+      ? `供数功能已启用（${feature.enabled_at || ""}）`
+      : "供数功能未启用：发布后仅登记为 feature_disabled，不产生供数明细";
+    block.querySelector(".supply-columns").textContent = validation.columns.join("、");
+    const detail = block.querySelector(".supply-detail");
+    if (validation.eligible) {
+      detail.textContent = `五列齐全，${validation.row_count} 行全部通过日期与非负整数校验。`;
+    } else {
+      const parts = [validation.reason_label || validation.reason];
+      if (validation.reason_detail) parts.push(validation.reason_detail);
+      if (validation.missing_columns && validation.missing_columns.length) {
+        parts.push("缺少列：" + validation.missing_columns.join("、"));
+      }
+      if (validation.issues && validation.issues.length) {
+        parts.push(validation.issues.slice(0, 5).map((i) =>
+          `第 ${i.row} 行 ${i.column}（${i.value}）：${i.reason}`).join("；"));
+      }
+      detail.textContent = parts.join("。") + "。批次仍可按原契约发布。";
+    }
+  }
+
   function renderPreview(preview) {
     currentPreview = preview;
     stack.replaceChildren();
@@ -162,6 +191,7 @@
     ["settlement", "ridership"].forEach((name) => {
       stack.appendChild(renderDownstream(name, preview.downstreams[name]));
     });
+    renderSupply(preview);
 
     root.hidden = false;
     confirmButton.disabled = !preview.convertible;

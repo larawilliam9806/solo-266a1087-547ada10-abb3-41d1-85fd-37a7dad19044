@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% block title %}客流供数下载 · 日结发布台{% endblock %}
+{% block content %}
+<section class="panel">
+  <h1>客流系统 · 按乘车日供数下载</h1>
+  <p class="muted">
+    同一乘车日的明细可能分散在多份出票日结里。选择连续 1～{{ max_range_days }} 个乘车日，
+    系统会把各出票日<strong>当前正式修订</strong>中已登记的供数明细合并打包为 ZIP：
+    每天一份 CSV，列序固定为
+    <code>{{ supply_columns|join("、") }}</code>，无明细的日期也只含表头。
+  </p>
+
+  <div id="supply-flag" class="alert {% if supply_status.enabled %}ok{% else %}warn{% endif %}">
+    {% if supply_status.enabled %}
+      供数功能已启用（启用时间 {{ supply_status.enabled_at }}）。只有启用之后发布的批次才会纳入供数。
+    {% else %}
+      供数功能尚未启用。启用之前发布的批次不会纳入供数；启用操作只影响之后的发布。
+      <form id="enable-form" method="post" class="form-actions" style="margin-top:0.6rem">
+        <button type="submit" class="button primary">启用客流供数功能</button>
+        <span id="enable-status" class="status" role="status"></span>
+      </form>
+    {% endif %}
+  </div>
+
+  <form id="supply-form" class="upload-form">
+    <div class="two-col">
+      <div class="field">
+        <label for="start">开始乘车日</label>
+        <input type="date" id="start" name="start" required>
+      </div>
+      <div class="field">
+        <label for="end">结束乘车日（不超过 {{ max_range_days }} 天）</label>
+        <input type="date" id="end" name="end" required>
+      </div>
+    </div>
+    <div class="form-actions">
+      <button type="submit" class="button">预览打包清单</button>
+      <button type="button" id="download-button" class="button primary" disabled>下载 ZIP</button>
+      <span id="supply-status" class="status" role="status"></span>
+    </div>
+  </form>
+</section>
+
+<section class="panel" id="supply-plan" hidden>
+  <h2>打包预览（同一快照）</h2>
+  <p class="muted">快照时间：<span id="snapshot-at" class="mono"></span>。包内明细与清单均取自该快照，打包期间仍可确认日结。</p>
+  <h3>包内文件</h3>
+  <div class="table-scroll">
+    <table class="grid compact">
+      <thead><tr><th>文件</th><th>乘车日</th><th>明细行数</th></tr></thead>
+      <tbody id="plan-files"></tbody>
+    </table>
+  </div>
+  <h3>逐文件来源（出票日 · 正式修订号）</h3>
+  <div class="table-scroll">
+    <table class="grid compact">
+      <thead><tr><th>文件</th><th>乘车日</th><th>行数</th><th>来源出票日</th><th>正式修订号</th><th>登记时间</th></tr></thead>
+      <tbody id="plan-sources"></tbody>
+    </table>
+  </div>
+  <h3>未纳入的当前正式批次及原因</h3>
+  <div class="table-scroll">
+    <table class="grid compact">
+      <thead><tr><th>出票日</th><th>当前修订</th><th>发布时间</th><th>原因代码</th><th>原因</th></tr></thead>
+      <tbody id="plan-exclusions"></tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', filename='supply.js') }}"></script>
+{% endblock %}

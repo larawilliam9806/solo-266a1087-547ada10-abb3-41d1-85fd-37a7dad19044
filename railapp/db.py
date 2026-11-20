@@ -60,11 +60,51 @@ CREATE TABLE IF NOT EXISTS previews (
     consumed_at            TEXT
 );
 
+-- Single-row key/value table for feature flags and other app-level state.
+CREATE TABLE IF NOT EXISTS app_state (
+    key          TEXT PRIMARY KEY,
+    value_json   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+
+-- One row per publication describing whether it feeds the ridership supply.
+-- Rows are immutable history: when an issue day gets a new revision, the old
+-- registration simply stops being the "current" one and is withdrawn by the
+-- join against days.current_rev.
+CREATE TABLE IF NOT EXISTS supply_registrations (
+    issue_day     TEXT NOT NULL,
+    rev           INTEGER NOT NULL,
+    eligible      INTEGER NOT NULL,
+    reason_code   TEXT,
+    reason_detail TEXT,
+    row_count     INTEGER NOT NULL,
+    created_at    TEXT NOT NULL,
+    PRIMARY KEY (issue_day, rev)
+);
+
+-- Detail rows of eligible registrations only.  Travel date is the lookup key
+-- for the ZIP export; issue_day+rev points back at the source batch.
+CREATE TABLE IF NOT EXISTS supply_rows (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    issue_day       TEXT NOT NULL,
+    rev             INTEGER NOT NULL,
+    travel_date     TEXT NOT NULL,
+    row_no          INTEGER NOT NULL,
+    train_no        TEXT NOT NULL,
+    depart_station  TEXT NOT NULL,
+    arrive_station  TEXT NOT NULL,
+    passenger_count TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_publications_day ON publications(day, rev);
 CREATE INDEX IF NOT EXISTS idx_previews_expiry ON previews(expires_at);
+CREATE INDEX IF NOT EXISTS idx_supply_rows_travel ON supply_rows(travel_date, issue_day, rev);
+CREATE INDEX IF NOT EXISTS idx_supply_rows_source ON supply_rows(issue_day, rev);
 """
 
 PREVIEW_TTL_SECONDS = 2 * 60 * 60
+
+SUPPLY_FEATURE_KEY = "ridership_supply_enabled"
 
 
 def utcnow():
@@ -246,3 +286,152 @@ def wait_for_write_lock(conn, attempts=200, delay=0.05):
         except sqlite3.OperationalError:
             time.sleep(delay)
     raise sqlite3.OperationalError("database is locked")
+
+
+# ---------------------------------------------------------------------------
+# Ridership supply feature flag and registrations
+# ---------------------------------------------------------------------------
+def get_state(conn, key):
+    row = conn.execute(
+        "SELECT value_json, updated_at FROM app_state WHERE key = ?", (key,)
+    ).fetchone()
+    if row is None:
+        return None
+    return {"value": json.loads(row["value_json"]), "updated_at": row["updated_at"]}
+
+
+def set_state(conn, key, value):
+    conn.execute(
+        """INSERT INTO app_state (key, value_json, updated_at) VALUES (?, ?, ?)
+           ON CONFLICT(key) DO UPDATE SET
+               value_json = excluded.value_json,
+               updated_at = excluded.updated_at""",
+        (key, json.dumps(value, ensure_ascii=False), iso(utcnow())),
+    )
+
+
+def supply_feature_status(conn):
+    state = get_state(conn, SUPPLY_FEATURE_KEY)
+    if not state or not state["value"]:
+        return {"enabled": False, "enabled_at": None}
+    return {"enabled": True, "enabled_at": state["updated_at"]}
+
+
+def enable_supply_feature(conn):
+    """Idempotently turn the feature on; the first call fixes the cutoff time."""
+    current = supply_feature_status(conn)
+    if current["enabled"]:
+        return current
+    now = iso(utcnow())
+    conn.execute(
+        "INSERT INTO app_state (key, value_json, updated_at) VALUES (?, ?, ?)",
+        (SUPPLY_FEATURE_KEY, json.dumps(True), now),
+    )
+    return {"enabled": True, "enabled_at": now}
+
+
+def insert_supply_registration(conn, *, issue_day, rev, eligible, reason_code,
+                               reason_detail, row_count, created_at):
+    conn.execute(
+        """INSERT INTO supply_registrations
+           (issue_day, rev, eligible, reason_code, reason_detail, row_count, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (issue_day, rev, 1 if eligible else 0, reason_code, reason_detail,
+         row_count, created_at),
+    )
+
+
+def insert_supply_rows(conn, *, issue_day, rev, rows, created_at):
+    conn.executemany(
+        """INSERT INTO supply_rows
+           (issue_day, rev, travel_date, row_no, train_no, depart_station,
+            arrive_station, passenger_count)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        [
+            (issue_day, rev, values[3], row_no, values[0], values[1],
+             values[2], values[4])
+            for row_no, values in enumerate(rows, start=1)
+        ],
+    )
+
+
+def get_supply_registration(conn, issue_day, rev):
+    row = conn.execute(
+        "SELECT * FROM supply_registrations WHERE issue_day = ? AND rev = ?",
+        (issue_day, rev),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def current_supply_rows_for_dates(conn, travel_days):
+    """Registered rows for the given travel dates from *current* revisions only.
+
+    The join on ``days.current_rev`` is what withdraws an old issue-day
+    revision's details the moment a new official revision takes over, even
+    when the new revision contributes nothing.
+    """
+    if not travel_days:
+        return []
+    placeholders = ",".join("?" for _ in travel_days)
+    rows = conn.execute(
+        f"""SELECT sr.travel_date, sr.issue_day, sr.rev, sr.row_no,
+                   sr.train_no, sr.depart_station, sr.arrive_station,
+                   sr.passenger_count, g.created_at AS registered_at
+              FROM supply_rows sr
+              JOIN days d ON d.day = sr.issue_day
+              JOIN supply_registrations g
+                ON g.issue_day = sr.issue_day AND g.rev = sr.rev
+             WHERE sr.travel_date IN ({placeholders})
+               AND d.current_rev = sr.rev
+               AND g.eligible = 1
+             ORDER BY sr.travel_date, sr.issue_day, sr.rev, sr.row_no""",
+        travel_days,
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def current_supply_sources(conn, travel_days):
+    """Current-revision registrations relevant to this window.
+
+    Includes eligible batches whose rows touch any requested travel date, plus
+    every current ineligible batch (so the manifest can explain exclusions).
+    """
+    if not travel_days:
+        return []
+    placeholders = ",".join("?" for _ in travel_days)
+    rows = conn.execute(
+        f"""SELECT * FROM (
+                SELECT g.issue_day, g.rev, g.eligible, g.reason_code,
+                       g.reason_detail, g.row_count, g.created_at,
+                       p.created_at AS published_at
+                  FROM supply_registrations g
+                  JOIN days d ON d.day = g.issue_day
+                  JOIN publications p ON p.day = g.issue_day AND p.rev = g.rev
+                 WHERE g.rev = d.current_rev AND g.eligible = 0
+                UNION
+                SELECT g.issue_day, g.rev, g.eligible, g.reason_code,
+                       g.reason_detail, g.row_count, g.created_at,
+                       p.created_at AS published_at
+                  FROM supply_registrations g
+                  JOIN days d ON d.day = g.issue_day
+                  JOIN publications p ON p.day = g.issue_day AND p.rev = g.rev
+                 WHERE g.rev = d.current_rev AND g.eligible = 1
+                   AND EXISTS (
+                       SELECT 1 FROM supply_rows sr
+                        WHERE sr.issue_day = g.issue_day AND sr.rev = g.rev
+                          AND sr.travel_date IN ({placeholders})))
+             ORDER BY issue_day""",
+        travel_days,
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def all_current_publications(conn):
+    """Every issue day's current official revision, with publication metadata."""
+    rows = conn.execute(
+        """SELECT p.day AS issue_day, p.rev, p.created_at AS published_at
+             FROM publications p
+             JOIN days d ON d.day = p.day AND d.current_rev = p.rev
+            ORDER BY p.day"""
+    ).fetchall()
+    return [dict(r) for r in rows]
